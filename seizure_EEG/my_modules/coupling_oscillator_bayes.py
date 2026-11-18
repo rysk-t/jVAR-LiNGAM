@@ -22,7 +22,7 @@ Why the result does not change
   ``block_size=1`` is the plain per-sample update.
 * The sum over samples of the one-step log-likelihoods equals the log marginal likelihood
   of the batch model, so ``log_evidence_grid`` scores a whole (P, precision) grid from one
-  set of Gram matrices.
+  streamed QR factorisation per oscillator.
 
 Input dtype
 -----------
@@ -35,14 +35,26 @@ float32 values are passed to the original as float64).
 Only ``T == 1`` (the value used by every script) is supported.
 """
 
+import contextlib
 import numbers
 
 import numpy as np
-from scipy.linalg import block_diag, cho_factor, cho_solve, solve_triangular
+from scipy.linalg import block_diag, solve_triangular
 
 TWO_PI = 2 * np.pi
 LOG_2PI = np.log(2 * np.pi)
 _MAX_FEATURE_ELEMENTS = 2 ** 25      # cap on (N * samples * d) per pass in log_evidence_grid
+
+
+def _single_thread_blas():
+    """BLAS limited to one thread: the QR/SVD calls in log_evidence_grid act on small matrices
+    (about 2PN columns), where a multi-threaded BLAS spends most of its time on thread start-up.
+    Uses threadpoolctl (a scikit-learn dependency) when available."""
+    try:
+        from threadpoolctl import threadpool_limits
+    except ImportError:
+        return contextlib.nullcontext()
+    return threadpool_limits(limits=1, user_api="blas")
 
 
 def _positive_int(name, value):
@@ -61,8 +73,8 @@ def _positive_float(name, value):
 
 def _as_phase_array(x):
     x = np.asarray(x, dtype=np.float64)
-    if x.ndim != 2 or x.shape[0] < 2:
-        raise ValueError(f"phases must be a 2-D array (Nt >= 2, N), got shape {x.shape}")
+    if x.ndim != 2 or x.shape[0] < 2 or x.shape[1] < 1:
+        raise ValueError(f"phases must be a 2-D array (Nt >= 2, N >= 1), got shape {x.shape}")
     if not np.all(np.isfinite(x)):
         raise ValueError("phases contain non-finite values")
     return x
@@ -182,8 +194,8 @@ def log_evidence_grid(theta, h, P_list, prec_param_list, chunk=2048):
     """Scores of ``CouplingOscillator`` for every (P, prec_param) cell, without fitting each cell.
 
     theta : (Nt, N) wrapped phases (the array passed to ``CouplingOscillator``).
-    chunk : maximum number of samples per pass over the data (lowered automatically so that
-            one block of features stays below about 256 MB).
+    chunk : maximum number of samples per block of the pass over the data (lowered
+            automatically so that one block of features stays below about 256 MB).
     Returns a dict of arrays shaped (len(P_list), len(prec_param_list)):
       loglike_sum   -- model.loglike.sum(), i.e. the log marginal likelihood (log evidence)
       loglike_mean  -- np.mean(model.loglike)
@@ -193,10 +205,16 @@ def log_evidence_grid(theta, h, P_list, prec_param_list, chunk=2048):
                        which already penalises model size, not the maximised log-likelihood;
                        and k includes the N*2*P self-coupling columns, which are always zero.
 
-    The quadratic term y^T C^{-1} y is evaluated as ||y - F m||^2 / s2 + ||m||^2 at the posterior
-    mean m, with the residual y - F m computed from the data in a second pass. Evaluating it as a
-    difference of Gram-matrix terms loses digits when the residual is much smaller than y
-    (high precision, nearly noise-free phases).
+    Method. For each oscillator the identically zero self-coupling columns are dropped and the
+    other columns are ordered [1 | cos p=1 | sin p=1 | ... | cos Pmax | sin Pmax], so the order-P
+    model uses the leading k = 1 + 2P(N-1) columns. One pass over the data computes the R factor
+    of the QR decomposition of [F | y]. For each P, the SVD R[:k, :k] = W diag(sv) V^T then gives,
+    for every noise variance s2 = 1/prec_param,
+        log|s2 I_n + F F^T|           = sum log(sv^2 + s2) + (n - k) log s2
+        y^T (s2 I_n + F F^T)^{-1} y   = ||y_perp||^2 / s2 + sum (W^T c)^2 / (sv^2 + s2)
+    with c = R[:k, -1] and ||y_perp||^2 = sum R[k:, -1]^2 (the least-squares residual).
+    No term is a difference of large numbers, so the result does not lose digits when the
+    residual is much smaller than y, and each extra precision value costs O(k).
     """
     chunk = _positive_int("chunk", chunk)
     h = _positive_float("h", h)
@@ -214,53 +232,42 @@ def log_evidence_grid(theta, h, P_list, prec_param_list, chunk=2048):
     n = Nt - 1
     Pmax = int(P_list.max())
     dmax = 2 * Pmax * N + 1
+    kmax = 1 + 2 * Pmax * (N - 1)
+
+    # per oscillator: columns of fourier_features without the self-coupling ones, P-nested order
+    idx = np.empty((N, kmax), dtype=int)
+    for i in range(N):
+        others = np.array([j for j in range(N) if j != i], dtype=int)
+        cols = [dmax - 1]
+        for p in range(Pmax):
+            cols.extend(2 * N * p + others)
+            cols.extend(2 * N * p + N + others)
+        idx[i] = cols
+
+    # one pass: R factor of [F | y] per oscillator (streamed QR)
     step = max(1, min(chunk, _MAX_FEATURE_ELEMENTS // (N * dmax)))
     y = phase_velocity(x, h)
-
-    # pass 1: Gram matrices and F^T y for the largest P (smaller P use a column subset)
-    Gm = np.zeros((N, dmax, dmax))
-    bv = np.zeros((N, dmax))
-    for t0 in range(0, n, step):
-        t1 = min(t0 + step, n)
-        F = fourier_features(x[t0:t1], Pmax).transpose(1, 0, 2)   # (N, b, dmax)
-        Gm += np.matmul(F.transpose(0, 2, 1), F)
-        bv += np.einsum("nbd,bn->nd", F, y[t0:t1])
-
-    # posterior mean and log|s2 I + F^T F| for every cell and oscillator
-    cells = [(a, b, int(P), 1.0 / pr) for a, P in enumerate(P_list) for b, pr in enumerate(prec)]
-    M = np.zeros((N, dmax, len(cells)))       # posterior means, zero outside the cell's columns
-    logdetA = np.zeros((N, len(cells)))
-    mm = np.zeros((N, len(cells)))
-    for c, (a, b, P, s2) in enumerate(cells):
-        cols = np.r_[0:2 * N * P, dmax - 1]
-        for i in range(N):
-            A = Gm[i][np.ix_(cols, cols)]
-            A[np.diag_indices_from(A)] += s2
-            try:
-                cf = cho_factor(A, lower=True)
-            except np.linalg.LinAlgError as e:
-                raise np.linalg.LinAlgError(
-                    f"s2*I + F^T F is not positive definite (P={P}, prec_param={1 / s2:g}, "
-                    f"oscillator {i})") from e
-            m = cho_solve(cf, bv[i][cols])
-            M[i, cols, c] = m
-            logdetA[i, c] = 2 * np.log(np.diag(cf[0])).sum()
-            mm[i, c] = m @ m
-
-    # pass 2: residual sum of squares at the posterior mean, from the data
-    rss = np.zeros((N, len(cells)))
-    for t0 in range(0, n, step):
-        t1 = min(t0 + step, n)
-        F = fourier_features(x[t0:t1], Pmax).transpose(1, 0, 2)   # (N, b, dmax)
-        R = y[t0:t1].T[:, :, None] - np.matmul(F, M)               # (N, b, cells)
-        rss += (R ** 2).sum(axis=1)
-
+    s2 = 1.0 / prec
     ll = np.zeros((len(P_list), len(prec)))
-    for c, (a, b, P, s2) in enumerate(cells):
-        d = 2 * N * P + 1
-        logdetC = logdetA[:, c] + (n - d) * np.log(s2)
-        quad = rss[:, c] / s2 + mm[:, c]
-        ll[a, b] = (-0.5 * (n * LOG_2PI + logdetC + quad)).sum()
-    k = (N * (N * 2 * P_list + 1))[:, None]
+    with _single_thread_blas():
+        R = np.zeros((N, kmax + 1, kmax + 1))
+        for t0 in range(0, n, step):
+            t1 = min(t0 + step, n)
+            F = fourier_features(x[t0:t1], Pmax).transpose(1, 0, 2)      # (N, b, dmax)
+            Fi = np.take_along_axis(F, idx[:, None, :], axis=2)          # (N, b, kmax)
+            A = np.concatenate([Fi, y[t0:t1].T[:, :, None]], axis=2)     # (N, b, kmax + 1)
+            R = np.linalg.qr(np.concatenate([R, A], axis=1), mode="r")
+
+        for a, P in enumerate(P_list):
+            k = 1 + 2 * int(P) * (N - 1)
+            c = R[:, :k, -1]                                              # (N, k)
+            tail2 = (R[:, k:, -1] ** 2).sum(axis=1)                       # (N,)
+            W, sv, _ = np.linalg.svd(R[:, :k, :k])
+            u2 = np.einsum("nkj,nk->nj", W, c) ** 2                       # (W^T c)^2
+            den = sv[:, None, :] ** 2 + s2[None, :, None]                 # (N, n_prec, k)
+            logdet = np.log(den).sum(axis=2) + (n - k) * np.log(s2)[None, :]
+            quad = tail2[:, None] / s2[None, :] + (u2[:, None, :] / den).sum(axis=2)
+            ll[a] = (-0.5 * (n * LOG_2PI + logdet + quad)).sum(axis=0)
+    kb = (N * (N * 2 * P_list + 1))[:, None]
     return dict(P_list=P_list, prec_param_list=prec, loglike_sum=ll, loglike_mean=ll / n,
-                BIC=k * np.log(n) - 2 * ll)
+                BIC=kb * np.log(n) - 2 * ll)

@@ -81,6 +81,30 @@ def test_evidence_grid_matches_analytic_at_high_precision():
             assert abs(ev["loglike_sum"][a, b] - analytic(prec)) <= 1e-10 * abs(analytic(prec)), (a, prec)
 
 
+def test_evidence_grid_collinear_columns_matches_analytic():
+    """N oscillators with identical phases rotating uniformly: every non-zero regressor of an
+    oscillator is a column of ones (1 + P(N-1) of them), so F F^T = m 11^T is rank one."""
+    N, P, h, n = 4, 2, 0.01, 1000
+    x = np.repeat(((np.arange(n + 1) % 8) * (np.pi / 4))[:, None], N, axis=1)
+    c, m = (np.pi / 4) / h, 1 + P * (N - 1)
+    for prec in (2.0, 1e6, 1e10):
+        s2 = 1 / prec
+        ref = -0.5 * N * (n * np.log(2 * np.pi) + (n - 1) * np.log(s2) + np.log(s2 + n * m)
+                          + n * c ** 2 / (s2 + n * m))
+        got = log_evidence_grid(x, h, [P], [prec])["loglike_sum"][0, 0]
+        assert abs(got - ref) <= 1e-10 * abs(ref), (prec, got, ref)
+
+
+def test_dense_precision_grid_matches_sequential_fits():
+    x = _load()["theta"].T[:500]
+    precs = np.logspace(np.log10(0.02), np.log10(2.0), 300)
+    ev = log_evidence_grid(x, 0.01, [2, 4], precs)
+    for a, P in enumerate([2, 4]):
+        for b in (0, 137, 299):
+            s = CouplingOscillator(x, P, 1, 0.01, precs[b]).fit_model().loglike.sum()
+            assert abs(ev["loglike_sum"][a, b] - s) / abs(s) < 1e-10, (P, b)
+
+
 def test_sequential_fit_matches_analytic():
     x, h, analytic = _uniform_rotation()
     for prec, rtol in ((2.0, 1e-12), (1e6, 1e-10), (1e10, 1e-7)):
@@ -110,7 +134,7 @@ def test_invalid_arguments_raise():
         except ValueError:
             continue
         raise AssertionError(f"accepted {kw}")
-    for bad_x in (x[:1], x[:, 0], np.where(np.arange(50)[:, None] == 3, np.nan, x)):
+    for bad_x in (x[:1], x[:, 0], np.zeros((5, 0)), np.where(np.arange(50)[:, None] == 3, np.nan, x)):
         try:
             CouplingOscillator(bad_x, 2, 1, 0.01, 2.0).fit_model()
         except ValueError:
