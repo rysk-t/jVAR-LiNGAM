@@ -37,24 +37,38 @@ Only ``T == 1`` (the value used by every script) is supported.
 
 import contextlib
 import numbers
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-from scipy.linalg import block_diag, solve_triangular
+from scipy.linalg import block_diag, qr as scipy_qr, solve_triangular
 
 TWO_PI = 2 * np.pi
 LOG_2PI = np.log(2 * np.pi)
 _MAX_FEATURE_ELEMENTS = 2 ** 25      # cap on (N * samples * d) per pass in log_evidence_grid
+_BLAS_LOCK = threading.Lock()
 
 
+@contextlib.contextmanager
 def _single_thread_blas():
-    """BLAS limited to one thread: the QR/SVD calls in log_evidence_grid act on small matrices
-    (about 2PN columns), where a multi-threaded BLAS spends most of its time on thread start-up.
-    Uses threadpoolctl (a scikit-learn dependency) when available."""
+    """Run a block with BLAS limited to one thread (threadpoolctl, a scikit-learn dependency;
+    no-op if it is not installed).
+
+    The QR/SVD calls of log_evidence_grid act on small matrices (about 2PN columns); with a
+    multi-threaded BLAS they spend most of their time on thread start-up, so they run on one
+    BLAS thread each and are parallelised over oscillators instead. The BLAS setting is
+    process-wide: calls are serialised by a module lock so that the caller's setting is always
+    restored on exit, but while a call runs, BLAS calls made by other threads of the process
+    also use one thread.
+    """
     try:
         from threadpoolctl import threadpool_limits
     except ImportError:
-        return contextlib.nullcontext()
-    return threadpool_limits(limits=1, user_api="blas")
+        yield
+        return
+    with _BLAS_LOCK, threadpool_limits(limits=1, user_api="blas"):
+        yield
 
 
 def _positive_int(name, value):
@@ -249,25 +263,36 @@ def log_evidence_grid(theta, h, P_list, prec_param_list, chunk=2048):
     y = phase_velocity(x, h)
     s2 = 1.0 / prec
     ll = np.zeros((len(P_list), len(prec)))
-    with _single_thread_blas():
-        R = np.zeros((N, kmax + 1, kmax + 1))
+    kP = [1 + 2 * int(P) * (N - 1) for P in P_list]
+    # SVD tasks, largest first for load balance
+    tasks = sorted(((a, i) for a in range(len(P_list)) for i in range(N)), key=lambda t: -kP[t[0]])
+
+    def svd_task(t):
+        a, i = t
+        k = kP[a]
+        W, sv, _ = np.linalg.svd(R[i][:k, :k])
+        return t, sv, (W.T @ R[i][:k, -1]) ** 2                          # (W^T c)^2
+
+    workers = max(1, min(N, os.cpu_count() or 1))
+    with _single_thread_blas(), ThreadPoolExecutor(max_workers=workers) as ex:
+        R = [np.zeros((kmax + 1, kmax + 1)) for _ in range(N)]
         for t0 in range(0, n, step):
             t1 = min(t0 + step, n)
             F = fourier_features(x[t0:t1], Pmax).transpose(1, 0, 2)      # (N, b, dmax)
             Fi = np.take_along_axis(F, idx[:, None, :], axis=2)          # (N, b, kmax)
             A = np.concatenate([Fi, y[t0:t1].T[:, :, None]], axis=2)     # (N, b, kmax + 1)
-            R = np.linalg.qr(np.concatenate([R, A], axis=1), mode="r")
+            R = list(ex.map(
+                lambda i: scipy_qr(np.concatenate([R[i], A[i]], axis=0), mode="r",
+                                   check_finite=False)[0][:kmax + 1], range(N)))
+        results = list(ex.map(svd_task, tasks))
 
-        for a, P in enumerate(P_list):
-            k = 1 + 2 * int(P) * (N - 1)
-            c = R[:, :k, -1]                                              # (N, k)
-            tail2 = (R[:, k:, -1] ** 2).sum(axis=1)                       # (N,)
-            W, sv, _ = np.linalg.svd(R[:, :k, :k])
-            u2 = np.einsum("nkj,nk->nj", W, c) ** 2                       # (W^T c)^2
-            den = sv[:, None, :] ** 2 + s2[None, :, None]                 # (N, n_prec, k)
-            logdet = np.log(den).sum(axis=2) + (n - k) * np.log(s2)[None, :]
-            quad = tail2[:, None] / s2[None, :] + (u2[:, None, :] / den).sum(axis=2)
-            ll[a] = (-0.5 * (n * LOG_2PI + logdet + quad)).sum(axis=0)
+    for (a, i), sv, u2 in results:
+        k = kP[a]
+        tail2 = (R[i][k:, -1] ** 2).sum()
+        den = sv[None, :] ** 2 + s2[:, None]                              # (n_prec, k)
+        logdet = np.log(den).sum(axis=1) + (n - k) * np.log(s2)
+        quad = tail2 / s2 + (u2[None, :] / den).sum(axis=1)
+        ll[a] += -0.5 * (n * LOG_2PI + logdet + quad)
     kb = (N * (N * 2 * P_list + 1))[:, None]
     return dict(P_list=P_list, prec_param_list=prec, loglike_sum=ll, loglike_mean=ll / n,
                 BIC=kb * np.log(n) - 2 * ll)

@@ -105,6 +105,29 @@ def test_dense_precision_grid_matches_sequential_fits():
             assert abs(ev["loglike_sum"][a, b] - s) / abs(s) < 1e-10, (P, b)
 
 
+def test_concurrent_grid_calls_restore_blas_threads():
+    try:
+        from threadpoolctl import threadpool_info, threadpool_limits
+    except ImportError:
+        return
+    import threading
+    x = _load()["theta"].T[:300]
+    with threadpool_limits(limits=3, user_api="blas"):
+        before = [i["num_threads"] for i in threadpool_info() if i["user_api"] == "blas"]
+        out = [None, None]
+
+        def run(j):
+            out[j] = log_evidence_grid(x, 0.01, [2, 3], [2.0, 0.2])["loglike_sum"]
+        th = [threading.Thread(target=run, args=(j,)) for j in range(2)]
+        for t in th:
+            t.start()
+        for t in th:
+            t.join()
+        after = [i["num_threads"] for i in threadpool_info() if i["user_api"] == "blas"]
+    assert before == after, (before, after)
+    assert np.array_equal(out[0], out[1])
+
+
 def test_sequential_fit_matches_analytic():
     x, h, analytic = _uniform_rotation()
     for prec, rtol in ((2.0, 1e-12), (1e6, 1e-10), (1e10, 1e-7)):
