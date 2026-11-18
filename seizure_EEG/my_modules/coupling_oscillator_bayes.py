@@ -35,10 +35,8 @@ float32 values are passed to the original as float64).
 Only ``T == 1`` (the value used by every script) is supported.
 """
 
-import contextlib
 import numbers
 import os
-import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -47,28 +45,8 @@ from scipy.linalg import block_diag, qr as scipy_qr, solve_triangular
 TWO_PI = 2 * np.pi
 LOG_2PI = np.log(2 * np.pi)
 _MAX_FEATURE_ELEMENTS = 2 ** 25      # cap on (N * samples * d) per pass in log_evidence_grid
-_BLAS_LOCK = threading.Lock()
-
-
-@contextlib.contextmanager
-def _single_thread_blas():
-    """Run a block with BLAS limited to one thread (threadpoolctl, a scikit-learn dependency;
-    no-op if it is not installed).
-
-    The QR/SVD calls of log_evidence_grid act on small matrices (about 2PN columns); with a
-    multi-threaded BLAS they spend most of their time on thread start-up, so they run on one
-    BLAS thread each and are parallelised over oscillators instead. The BLAS setting is
-    process-wide: calls are serialised by a module lock so that the caller's setting is always
-    restored on exit, but while a call runs, BLAS calls made by other threads of the process
-    also use one thread.
-    """
-    try:
-        from threadpoolctl import threadpool_limits
-    except ImportError:
-        yield
-        return
-    with _BLAS_LOCK, threadpool_limits(limits=1, user_api="blas"):
-        yield
+_PARALLEL_MIN_K = 64                 # threads in log_evidence_grid only from this matrix size on
+_MAX_AUTO_WORKERS = 8                # no gain beyond 8 threads measured on chb15_06 (15 channels)
 
 
 def _positive_int(name, value):
@@ -204,12 +182,18 @@ class CouplingOscillator:
         return block_diag(*self.K_blocks)
 
 
-def log_evidence_grid(theta, h, P_list, prec_param_list, chunk=2048):
+def log_evidence_grid(theta, h, P_list, prec_param_list, chunk=2048, n_jobs=None):
     """Scores of ``CouplingOscillator`` for every (P, prec_param) cell, without fitting each cell.
 
     theta : (Nt, N) wrapped phases (the array passed to ``CouplingOscillator``).
     chunk : maximum number of samples per block of the pass over the data (lowered
             automatically so that one block of features stays below about 256 MB).
+    n_jobs : threads for the per-oscillator QR updates and SVDs. None (default): up to 8
+             threads when the per-oscillator matrices have at least 64 columns, otherwise
+             serial; 1: serial. BLAS settings are never changed. The threaded path is fastest
+             when the caller limits BLAS to one thread, e.g.
+             ``with threadpoolctl.threadpool_limits(1): log_evidence_grid(...)``
+             (chb15_06, 15 channels, 15 cells: 0.09 s with 1 BLAS thread, 0.21 s with 24).
     Returns a dict of arrays shaped (len(P_list), len(prec_param_list)):
       loglike_sum   -- model.loglike.sum(), i.e. the log marginal likelihood (log evidence)
       loglike_mean  -- np.mean(model.loglike)
@@ -261,31 +245,46 @@ def log_evidence_grid(theta, h, P_list, prec_param_list, chunk=2048):
     # one pass: R factor of [F | y] per oscillator (streamed QR)
     step = max(1, min(chunk, _MAX_FEATURE_ELEMENTS // (N * dmax)))
     y = phase_velocity(x, h)
-    s2 = 1.0 / prec
-    ll = np.zeros((len(P_list), len(prec)))
-    kP = [1 + 2 * int(P) * (N - 1) for P in P_list]
-    # SVD tasks, largest first for load balance
-    tasks = sorted(((a, i) for a in range(len(P_list)) for i in range(N)), key=lambda t: -kP[t[0]])
+    if n_jobs is None:
+        workers = min(N, _MAX_AUTO_WORKERS, os.cpu_count() or 1)             if (N >= 2 and kmax >= _PARALLEL_MIN_K) else 1
+    else:
+        workers = min(_positive_int("n_jobs", n_jobs), N)
 
-    def svd_task(t):
-        a, i = t
-        k = kP[a]
-        W, sv, _ = np.linalg.svd(R[i][:k, :k])
-        return t, sv, (W.T @ R[i][:k, -1]) ** 2                          # (W^T c)^2
-
-    workers = max(1, min(N, os.cpu_count() or 1))
-    with _single_thread_blas(), ThreadPoolExecutor(max_workers=workers) as ex:
-        R = [np.zeros((kmax + 1, kmax + 1)) for _ in range(N)]
+    def blocks():
         for t0 in range(0, n, step):
             t1 = min(t0 + step, n)
             F = fourier_features(x[t0:t1], Pmax).transpose(1, 0, 2)      # (N, b, dmax)
             Fi = np.take_along_axis(F, idx[:, None, :], axis=2)          # (N, b, kmax)
-            A = np.concatenate([Fi, y[t0:t1].T[:, :, None]], axis=2)     # (N, b, kmax + 1)
-            R = list(ex.map(
-                lambda i: scipy_qr(np.concatenate([R[i], A[i]], axis=0), mode="r",
-                                   check_finite=False)[0][:kmax + 1], range(N)))
-        results = list(ex.map(svd_task, tasks))
+            yield np.concatenate([Fi, y[t0:t1].T[:, :, None]], axis=2)   # (N, b, kmax + 1)
 
+    kP = [1 + 2 * int(P) * (N - 1) for P in P_list]
+    results = []                                     # ((a, i), singular values, (W^T c)^2)
+    if workers == 1:
+        R = np.zeros((N, kmax + 1, kmax + 1))
+        for A in blocks():
+            R = np.linalg.qr(np.concatenate([R, A], axis=1), mode="r")
+        for a, k in enumerate(kP):
+            W, sv, _ = np.linalg.svd(R[:, :k, :k])
+            u2 = np.einsum("nkj,nk->nj", W, R[:, :k, -1]) ** 2
+            results += [((a, i), sv[i], u2[i]) for i in range(N)]
+    else:
+        def svd_task(t):
+            a, i = t
+            k = kP[a]
+            W, sv, _ = np.linalg.svd(R[i][:k, :k])
+            return t, sv, (W.T @ R[i][:k, -1]) ** 2
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            R = [np.zeros((kmax + 1, kmax + 1)) for _ in range(N)]
+            for A in blocks():
+                R = list(ex.map(
+                    lambda i: scipy_qr(np.concatenate([R[i], A[i]], axis=0), mode="r",
+                                       check_finite=False)[0][:kmax + 1], range(N)))
+            tasks = sorted(((a, i) for a in range(len(kP)) for i in range(N)), key=lambda t: -kP[t[0]])
+            results = list(ex.map(svd_task, tasks))      # largest SVDs first
+
+    s2 = 1.0 / prec
+    ll = np.zeros((len(P_list), len(prec)))
     for (a, i), sv, u2 in results:
         k = kP[a]
         tail2 = (R[i][k:, -1] ** 2).sum()

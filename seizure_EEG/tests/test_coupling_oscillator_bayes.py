@@ -105,27 +105,35 @@ def test_dense_precision_grid_matches_sequential_fits():
             assert abs(ev["loglike_sum"][a, b] - s) / abs(s) < 1e-10, (P, b)
 
 
-def test_concurrent_grid_calls_restore_blas_threads():
+def test_grid_does_not_change_blas_threads_even_when_concurrent():
     try:
-        from threadpoolctl import threadpool_info, threadpool_limits
+        from threadpoolctl import threadpool_info
     except ImportError:
         return
     import threading
     x = _load()["theta"].T[:300]
-    with threadpool_limits(limits=3, user_api="blas"):
-        before = [i["num_threads"] for i in threadpool_info() if i["user_api"] == "blas"]
-        out = [None, None]
+    before = [i["num_threads"] for i in threadpool_info() if i["user_api"] == "blas"]
+    out = [None, None]
 
-        def run(j):
-            out[j] = log_evidence_grid(x, 0.01, [2, 3], [2.0, 0.2])["loglike_sum"]
-        th = [threading.Thread(target=run, args=(j,)) for j in range(2)]
-        for t in th:
-            t.start()
-        for t in th:
-            t.join()
-        after = [i["num_threads"] for i in threadpool_info() if i["user_api"] == "blas"]
+    def run(j):
+        out[j] = log_evidence_grid(x, 0.01, [2, 3], [2.0, 0.2])["loglike_sum"]
+    th = [threading.Thread(target=run, args=(j,)) for j in range(2)]
+    for t in th:
+        t.start()
+    for t in th:
+        t.join()
+    after = [i["num_threads"] for i in threadpool_info() if i["user_api"] == "blas"]
     assert before == after, (before, after)
     assert np.array_equal(out[0], out[1])
+
+
+def test_serial_and_threaded_paths_agree():
+    x = _load()["theta"].T[:500]
+    precs = [2.0, 0.2, 0.02]
+    s = log_evidence_grid(x, 0.01, [2, 3, 6], precs, n_jobs=1)["loglike_sum"]
+    for nj in (2, 8, None):
+        t = log_evidence_grid(x, 0.01, [2, 3, 6], precs, n_jobs=nj)["loglike_sum"]
+        assert np.abs(t - s).max() <= 1e-12 * np.abs(s).max(), nj
 
 
 def test_sequential_fit_matches_analytic():
@@ -149,11 +157,13 @@ def test_invalid_arguments_raise():
             continue
         raise AssertionError(f"accepted {kw}")
     for kw in (dict(chunk=0), dict(chunk=-1), dict(P_list=[0]), dict(P_list=[]),
-               dict(prec_param_list=[-1.0]), dict(prec_param_list=[])):
-        args = dict(P_list=[2], prec_param_list=[2.0], chunk=2048)
+               dict(prec_param_list=[-1.0]), dict(prec_param_list=[]), dict(n_jobs=0),
+               dict(n_jobs=-1), dict(n_jobs=1.5)):
+        args = dict(P_list=[2], prec_param_list=[2.0], chunk=2048, n_jobs=None)
         args.update(kw)
         try:
-            log_evidence_grid(x, 0.01, args["P_list"], args["prec_param_list"], chunk=args["chunk"])
+            log_evidence_grid(x, 0.01, args["P_list"], args["prec_param_list"], chunk=args["chunk"],
+                              n_jobs=args["n_jobs"])
         except ValueError:
             continue
         raise AssertionError(f"accepted {kw}")
