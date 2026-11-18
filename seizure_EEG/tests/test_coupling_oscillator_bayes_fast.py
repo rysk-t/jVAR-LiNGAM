@@ -1,9 +1,10 @@
-"""Regression tests for my_modules/coupling_oscillator_bayes.py.
+"""Regression tests for my_modules/coupling_oscillator_bayes_fast.py.
 
-Reference: save_data/est_model/bayse_est_chb15_06.npy, written by eeg_bayes_est_main.py with the
-original (pre-replacement) CouplingOscillator (P = 3, prec_param = 1/0.1, Tstep = 1).
+References: the original class in my_modules/coupling_oscillator_bayes.py (run on a short segment),
+and save_data/est_model/bayse_est_chb15_06.npy, written by eeg_bayes_est_main.py with the original
+class (P = 3, prec_param = 1/0.1, Tstep = 1).
 
-Run:  python -m pytest seizure_EEG/tests   or   python seizure_EEG/tests/test_coupling_oscillator_bayes.py
+Run:  python -m pytest seizure_EEG/tests   or   python seizure_EEG/tests/test_coupling_oscillator_bayes_fast.py
 """
 import filecmp
 import os
@@ -14,7 +15,8 @@ import numpy as np
 EEG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO = os.path.dirname(EEG_DIR)
 sys.path.insert(0, EEG_DIR)
-from my_modules.coupling_oscillator_bayes import CouplingOscillator, log_evidence_grid
+from my_modules.coupling_oscillator_bayes import CouplingOscillator as OriginalCouplingOscillator
+from my_modules.coupling_oscillator_bayes_fast import CouplingOscillator, log_evidence_grid
 
 SAVED = os.path.join(EEG_DIR, "save_data", "est_model", "bayse_est_chb15_06.npy")
 
@@ -34,6 +36,17 @@ def test_reproduces_original_saved_outputs():
     assert _rel(m.coeff_sin, d["K2est"]) < 1e-9
     assert _rel(m.omega[-1], d["omega_est"]) < 1e-9
     assert _rel(m.y_hat, d["dtheta_pred"]) < 1e-9          # per-sample filtered predictions
+
+
+def test_matches_original_class():
+    x = _load()["theta"].T[:300, :4]
+    for P, prec in ((1, 10.0), (2, 0.5)):
+        orig = OriginalCouplingOscillator(x, P, 1, 0.01, prec)
+        orig.fit_model()                                     # returns None
+        m = CouplingOscillator(x, P, 1, 0.01, prec).fit_model()
+        for key in ("loglike", "y_hat", "omega", "coeff_cos", "coeff_sin", "Kb0"):
+            assert _rel(getattr(m, key), getattr(orig, key)) < 1e-10, (P, key)
+        assert _rel(m.pred_var, np.diagonal(orig.S, axis1=0, axis2=1)) < 1e-10, P
 
 
 def test_block_size_does_not_change_outputs():
@@ -176,8 +189,8 @@ def test_invalid_arguments_raise():
 
 
 def test_sim2_copy_is_identical():
-    sim2 = os.path.join(REPO, "numerical_simulations", "sim2", "my_modules", "coupling_oscillator_bayes.py")
-    here = os.path.join(EEG_DIR, "my_modules", "coupling_oscillator_bayes.py")
+    sim2 = os.path.join(REPO, "numerical_simulations", "sim2", "my_modules", "coupling_oscillator_bayes_fast.py")
+    here = os.path.join(EEG_DIR, "my_modules", "coupling_oscillator_bayes_fast.py")
     assert filecmp.cmp(sim2, here, shallow=False)
 
 
